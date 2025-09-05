@@ -1,0 +1,145 @@
+import bcrypt
+import jwt
+import uuid
+import datetime
+from psycopg2 import sql
+from psycopg2.extras import RealDictCursor
+from services.db_service import get_conn
+
+SECRET_KEY = "your-secret-key"  # Replace with env var in production
+RESET_TOKEN_EXPIRY_MINUTES = 15
+
+# -----------------------
+# User Authentication
+# -----------------------
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+
+
+def authenticate_user(email: str, password: str):
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM users WHERE email = %s", (email,))
+            user = cur.fetchone()
+
+    if user and verify_password(password, user["password"]):
+        return user
+    return None
+
+
+def register_user(email: str, password: str, name: str = None):
+    """Register a new user"""
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Check if user already exists
+                cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+                if cur.fetchone():
+                    return {"success": False, "message": "User already exists"}
+                
+                # Create new user
+                user_id = str(uuid.uuid4())
+                hashed_password = hash_password(password)
+                
+                cur.execute(
+                    "INSERT INTO users (id, email, password, name) VALUES (%s, %s, %s, %s)",
+                    (user_id, email, hashed_password, name)
+                )
+                conn.commit()
+                
+                # Return user data
+                cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+                user = cur.fetchone()
+                
+                return {"success": True, "user": user}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+def login_user(email: str, password: str):
+    """Login user and return token"""
+    user = authenticate_user(email, password)
+    if user:
+        token = create_access_token(user["id"])
+        return True, "Login successful", user
+    return False, "Invalid credentials", None
+
+
+# -----------------------
+# JWT Token Helpers
+# -----------------------
+
+def create_access_token(user_id: str):
+    payload = {
+        "sub": str(user_id),
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=1),
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+
+
+# -----------------------
+# Password Reset Feature
+# -----------------------
+
+def request_password_reset(email: str):
+    """Generate reset token and store in DB"""
+    token = str(uuid.uuid4())
+    expiry = datetime.datetime.utcnow() + datetime.timedelta(
+        minutes=RESET_TOKEN_EXPIRY_MINUTES
+    )
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+            user = cur.fetchone()
+            if not user:
+                return None
+
+            user_id = user[0]
+
+            # Store token in reset_tokens table
+            cur.execute(
+                """
+                INSERT INTO reset_tokens (id, user_id, token, expires_at)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (str(uuid.uuid4()), user_id, token, expiry),
+            )
+            conn.commit()
+    return token
+
+
+def verify_reset_token(token: str):
+    """Check if reset token is valid and not expired"""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM reset_tokens WHERE token = %s AND expires_at > NOW()",
+                (token,),
+            )
+            reset_entry = cur.fetchone()
+    return reset_entry
+
+
+def reset_password(token: str, new_password: str):
+    """Update user password if token is valid"""
+    reset_entry = verify_reset_token(token)
+    if not reset_entry:
+        return False
+
+    hashed = hash_password(new_password)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET password = %s WHERE id = %s",
+                (hashed, reset_entry["user_id"]),
+            )
+            cur.execute("DELETE FROM reset_tokens WHERE id = %s", (reset_entry["id"],))
+            conn.commit()
+    return True

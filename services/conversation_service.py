@@ -1,0 +1,85 @@
+import uuid
+from psycopg2.extras import RealDictCursor
+from services.db_service import get_conn
+
+def get_user_conversations(user_id: str):
+    """Get all conversations for a user"""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, title, created_at, updated_at 
+                FROM conversations 
+                WHERE user_id = %s 
+                ORDER BY updated_at DESC
+            """, (user_id,))
+            return cur.fetchall()
+
+def create_conversation(user_id: str, title: str = None):
+    """Create a new conversation"""
+    conv_id = str(uuid.uuid4())
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                INSERT INTO conversations (id, user_id, title)
+                VALUES (%s, %s, %s)
+                RETURNING *
+            """, (conv_id, user_id, title))
+            conn.commit()
+            return cur.fetchone()
+
+def get_conversation_messages(conversation_id: str):
+    """Get all messages for a conversation"""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT role, content, created_at 
+                FROM messages 
+                WHERE conversation_id = %s 
+                ORDER BY created_at ASC
+            """, (conversation_id,))
+            messages = cur.fetchall()
+            # Convert to the format expected by the app
+            return [{"role": msg["role"], "content": msg["content"]} for msg in messages]
+
+def add_message(conversation_id: str, role: str, content: str):
+    """Add a message to a conversation"""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                INSERT INTO messages (conversation_id, role, content)
+                VALUES (%s, %s, %s)
+                RETURNING *
+            """, (conversation_id, role, content))
+            
+            message = cur.fetchone()
+            
+            # Update conversation's updated_at timestamp
+            cur.execute("""
+                UPDATE conversations 
+                SET updated_at = NOW() 
+                WHERE id = %s
+            """, (conversation_id,))
+            
+            conn.commit()
+            return message
+
+def update_conversation_title(conversation_id: str, title: str):
+    """Update conversation title"""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                UPDATE conversations 
+                SET title = %s, updated_at = NOW() 
+                WHERE id = %s
+            """, (title, conversation_id))
+            conn.commit()
+
+def delete_conversation(conversation_id: str):
+    """Delete a conversation and all its messages"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # Messages will be deleted automatically due to CASCADE
+            cur.execute("DELETE FROM conversations WHERE id = %s", (conversation_id,))
+            deleted_rows = cur.rowcount
+            conn.commit()
+            return deleted_rows > 0
